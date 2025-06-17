@@ -10,6 +10,8 @@ permissions:
 
 jobs:
     build-deploy:
+        # 🚦 run only in the upstream repo
+        **if: ${{ github.repository == 'axolotl-ai-cloud/axolotl' }}**
         runs-on: ubuntu-latest
         steps:
         - name: Check out repository
