@@ -22,6 +22,8 @@
     <img src="https://github.com/axolotl-ai-cloud/axolotl/actions/workflows/multi-gpu-e2e.yml/badge.svg" alt="multigpu-semi-weekly tests">
 </p>
 
+> **Note:** This fork is for Medusa training on the latest (v0.9.2) version of the Axolotl framework.
+
 
 ## 🎉 Latest Updates
 
