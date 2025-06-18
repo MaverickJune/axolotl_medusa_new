@@ -1,0 +1,71 @@
+base_model: meta-llama/Llama-3.2-1B 
+
+# medusa-related settings
+plugins:
+  - axolotl.integrations.medusa.MedusaPlugin
+
+medusa: true  
+medusa_num_heads: 4 
+medusa_num_layers: 1
+medusa_train_only_heads: true        # Medusa-1 (freeze base model)  
+medusa_heads_coefficient: 0.2        # loss weighting for Medusa heads  
+medusa_decay_coefficient: 0.8        # no additional decay per head  
+medusa_scheduler: constant           # (other values currently behave like constant)
+medusa_logging: true
+medusa_lr_multiplier: 4.0           # can increase if heads need higher LR 
+ddp_find_unused_parameters: true
+
+# prepare datasets
+pretraining_datasets:
+  - path: json
+    data_files:
+      - /home/nxclab/wonjun/Medusa/ShareGPT_Vicuna_unfiltered/train_shareGPT_llama3.2_1B.jsonl
+val_set_size: 0.01
+output_dir: ./llama3/medusa/1B_stage1
+
+sequence_len: 2048
+sample_packing: true
+eval_sample_packing: true
+pad_to_sequence_len: true
+
+# prepare wandb for logging
+wandb_project: medusa_test
+wandb_entity:
+wandb_watch:
+wandb_run_id:
+wandb_log_model:
+
+# prepare training settings
+gradient_accumulation_steps: 4
+micro_batch_size: 2
+num_epochs: 2
+optimizer: adamw_bnb_8bit
+lr_scheduler: cosine
+learning_rate: 0.0005
+
+warmup_steps: 10
+evals_per_epoch: 4
+saves_per_epoch: 1
+weight_decay: 0.0
+special_tokens:
+   pad_token: <|end_of_text|>
+
+# model loading settings
+load_in_8bit: false
+load_in_4bit: false
+strict: false
+
+# datatype settings
+bf16: auto
+tf32: false
+
+# gradient checkpointing settings
+gradient_checkpointing: true
+resume_from_checkpoint:
+logging_steps: 1
+flash_attention: true
+
+loss_watchdog_threshold: 5.0
+loss_watchdog_patience: 3
+
+
