@@ -1,0 +1,3 @@
+plugins:
+  - axolotl.integrations.medusa.MedusaPlugin
+

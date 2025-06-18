@@ -1,10 +1,12 @@
 import logging
 from types import MethodType
 from typing import List, Optional
+import math
 
 import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss
+import torch.nn.functional as F
 from transformers.trainer_pt_utils import LabelSmoother
 from transformers import PretrainedConfig
 from axolotl.core.trainers.base import AxolotlTrainer
@@ -97,9 +99,13 @@ class AxolotlMedusaTrainer(AxolotlTrainer):
     """
     Custom Trainer to handle Medusa multi-head loss computation.
     """
-    def __init__(self, *args, medusa_num_heads=None, medusa_heads_coefficient=0.1, 
+    def __init__(self, *args,
+                 medusa_num_heads=None, medusa_heads_coefficient=0.1,
                  medusa_decay_coefficient=1.0, medusa_scheduler="constant",
-                 medusa_lr_multiplier=1.0, train_only_medusa_heads=True, **kwargs):
+                 medusa_lr_multiplier=1.0, train_only_medusa_heads=True,
+                 medusa_self_distillation=False, medusa_distillation_regularization=False,
+                 medusa_logging=False, medusa_num_unfreeze_layers=0,
+                 **kwargs):
         # Store Medusa parameters
         self.medusa_num_heads = medusa_num_heads or 0
         self.medusa_heads_coefficient = medusa_heads_coefficient or 1.0
@@ -107,6 +113,11 @@ class AxolotlMedusaTrainer(AxolotlTrainer):
         self.medusa_scheduler = medusa_scheduler or "constant"
         self.medusa_lr_multiplier = medusa_lr_multiplier or 1.0
         self.train_only_medusa_heads = train_only_medusa_heads
+        # Store advanced Medusa features
+        self.medusa_self_distillation = bool(medusa_self_distillation)
+        self.medusa_distillation_regularization = bool(medusa_distillation_regularization)
+        self.medusa_logging = bool(medusa_logging)
+        self.medusa_num_unfreeze_layers = medusa_num_unfreeze_layers or 0
         # Workaround for quantized models without LoRA: mark as quantized to bypass checks
         model = kwargs.get("model")
         if self.train_only_medusa_heads and model is not None and hasattr(model, "is_quantized"):
@@ -114,50 +125,132 @@ class AxolotlMedusaTrainer(AxolotlTrainer):
         super().__init__(*args, **kwargs)
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        """Compute custom loss combining base and Medusa head predictions."""
+        """Compute custom loss combining base and Medusa head predictions, with optional distillation regularization."""
         labels = inputs["labels"]
-        # Forward pass – will return stacked logits tensor:contentReference[oaicite:21]{index=21}
+        # Forward pass – will return stacked logits tensor (shape: [num_heads+1, batch, seq_len, vocab])
         logits = model(
-            input_ids=inputs.get("input_ids"), 
+            input_ids=inputs.get("input_ids"),
             attention_mask=inputs.get("attention_mask"),
             train_only_medusa_heads=self.train_only_medusa_heads
         )
         num_heads_total = logits.shape[0]  # = medusa_num_heads + 1 (including base)
-        loss_fct = CrossEntropyLoss()
         total_loss = 0.0
         log_metrics = {}
-        # Calculate loss for each head’s predictions:contentReference[oaicite:22]{index=22}:contentReference[oaicite:23]{index=23}
+
+        # If self-distillation is enabled, prepare base (teacher) logits distribution (detached)
+        teacher_logits_full = None
+        if self.medusa_self_distillation:
+            # Use base logits as teacher (detach to avoid gradient to base)
+            teacher_logits_full = logits[0].detach()  # shape: (batch, seq_len, vocab)
+        loss_fct = CrossEntropyLoss()
         for i in range(num_heads_total):
-            # Align logits and labels: head i predicts tokens shifted by i positions ahead:contentReference[oaicite:24]{index=24}:contentReference[oaicite:25]{index=25}
-            pred_logits = logits[i, :, : -(1 + i)]  # drop the last i+1 predictions
-            target_labels = labels[..., (1 + i) :]   # drop the first i+1 labels
-            pred_logits = pred_logits.reshape(-1, pred_logits.size(-1))
-            target_labels = target_labels.reshape(-1).to(pred_logits.device)
-            if target_labels.numel() == 0:
-                continue  # skip if sequence is too short for this head
-            loss_i = loss_fct(pred_logits, target_labels)
+            # Align logits and labels for head i: head i predicts tokens shifted by i+1 positions ahead
             if i == 0:
-                # Base head loss (only include if training base model):contentReference[oaicite:26]{index=26}
-                if not self.train_only_medusa_heads:
-                    total_loss += loss_i
+                # Base head predictions (next token)
+                pred_logits = logits[0][:, :-1, :]  # drop the last token prediction
+                target_labels = labels[..., 1:]      # drop the first token label
             else:
-                # Weighted Medusa head loss:contentReference[oaicite:27]{index=27}
-                coeff = 1.0
+                pred_logits = logits[i][:, :-(1 + i), :]  # drop the last i+1 predictions
+                target_labels = labels[..., (1 + i):]     # drop the first i+1 labels
+            # Flatten for loss computation
+            pred_logits_flat = pred_logits.reshape(-1, pred_logits.size(-1))
+            target_flat = target_labels.reshape(-1).to(pred_logits.device)
+            # Skip if no labels for this head (sequence too short)
+            if target_flat.numel() == 0:
+                continue
+
+            # Compute loss for this head
+            if i == 0:
+                # Base head loss (only include if training base model)
+                if not self.train_only_medusa_heads:
+                    if self.medusa_distillation_regularization:
+                        # Use label smoothing via KL (label smoothing with epsilon=0.1)
+                        # PyTorch CrossEntropyLoss supports label_smoothing in recent versions
+                        base_loss = F.cross_entropy(pred_logits_flat, target_flat, ignore_index=IGNORE_TOKEN_ID, label_smoothing=0.1)
+                    else:
+                        base_loss = loss_fct(pred_logits_flat, target_flat)
+                    total_loss += base_loss
+                    log_metrics[f"medusa0_loss"] = base_loss.item()
+            else:
+                # Medusa head loss (with weighting)
+                loss_i = loss_fct(pred_logits_flat, target_flat)
+                # Scheduler coefficient based on medusa_scheduler type
                 if self.medusa_scheduler == "constant":
-                    coeff = 1.0  # (could extend for other schedulers)
-                # Decay factor: medusa_decay_coefficient^i
-                total_loss += loss_i * (self.medusa_decay_coefficient ** i) * self.medusa_heads_coefficient * coeff
-            # (Optional) Compute accuracy metrics for logging
-            not_ignore = target_labels.ne(IGNORE_TOKEN_ID)
-            correct = None
+                    coeff_schedule = 1.0
+                elif self.medusa_scheduler == "linear":
+                    # Linearly increase weight over training progress
+                    if self.state and self.state.global_step is not None and self.state.max_steps is not None:
+                        progress = float(self.state.global_step) / float(self.state.max_steps) if self.state.max_steps > 0 else 1.0
+                    else:
+                        progress = 1.0
+                    coeff_schedule = progress
+                elif self.medusa_scheduler == "sine":
+                    if self.state and self.state.global_step is not None and self.state.max_steps is not None:
+                        progress = float(self.state.global_step) / float(self.state.max_steps) if self.state.max_steps > 0 else 1.0
+                    else:
+                        progress = 1.0
+                    coeff_schedule = math.sin(progress * math.pi / 2)  # Sine scheduler (0->1)
+                else:
+                    # Default to constant if unknown scheduler
+                    coeff_schedule = 1.0
+                # Decay factor for successive heads
+                head_weight = (self.medusa_decay_coefficient ** i) * self.medusa_heads_coefficient * coeff_schedule
+                total_loss += loss_i * head_weight
+                log_metrics[f"medusa{i}_loss"] = loss_i.item()
+            # Compute accuracy metrics for this head (top-1 to top-9 accuracy)
+            not_ignore = target_flat.ne(IGNORE_TOKEN_ID)
             with torch.no_grad():
-                # Example: top-1 accuracy for head i
-                _, top1 = pred_logits.max(dim=-1)
-                correct = top1.eq(target_labels)
-            if correct is not None:
-                log_metrics[f"medusa{i}_acc"] = (correct.masked_select(not_ignore).float().mean().item())
-            log_metrics[f"medusa{i}_loss"] = loss_i.item()
+                # Compute top-9 predictions for accuracy metrics
+                topk = min(9, pred_logits_flat.size(-1))
+                topk_vals, topk_idx = pred_logits_flat.topk(topk, dim=-1)
+                # Top-1 accuracy (same as original medusa{i}_acc)
+                correct_top1 = topk_idx[:, 0].eq(target_flat)
+                if correct_top1.numel() > 0:
+                    acc1 = correct_top1.masked_select(not_ignore).float().mean().item()
+                    log_metrics[f"medusa{i}_acc"] = acc1
+                # Top-k (2 through 9) accuracies
+                for k in range(2, 10):
+                    if topk_idx.size(1) < k:
+                        break  # if vocab smaller than k (unlikely)
+                    hits_k = (topk_idx[:, :k].eq(target_flat.unsqueeze(-1))).any(dim=-1)
+                    if hits_k.numel() > 0:
+                        acc_k = hits_k.masked_select(not_ignore).float().mean().item()
+                        log_metrics[f"medusa{i}_acc@{k}"] = acc_k
+            # If self-distillation is enabled, compute KL divergence between base (teacher) and medusa head i
+            if i > 0 and self.medusa_self_distillation and teacher_logits_full is not None:
+                # Align teacher and student predictions for this head
+                teacher_slice = teacher_logits_full[:, i:-1, :]  # base logits from index i to second-last
+                student_slice = logits[i][:, :-(1 + i), :].detach()  # medusa head i logits (detach student for teacher calc)
+                # Compute distribution for teacher and student
+                B, T, V = teacher_slice.shape
+                teacher_flat = teacher_slice.reshape(-1, V)
+                student_log_flat = F.log_softmax(student_slice.reshape(-1, V), dim=-1)
+                teacher_prob_flat = F.softmax(teacher_flat, dim=-1)
+                # Mask out ignore tokens positions
+                mask_flat = target_flat.ne(IGNORE_TOKEN_ID)
+                # (Mask needs to align dimensions: target_flat corresponds to labels for these predictions)
+                # Build mask for current head positions: target_flat already corresponds to head i labels after dropping initial tokens
+                if mask_flat.any():
+                    teacher_prob_masked = teacher_prob_flat[mask_flat]
+                    student_log_masked = student_log_flat[mask_flat]
+                    # KL divergence (teacher || student)
+                    kl_div = F.kl_div(student_log_masked, teacher_prob_masked, reduction="batchmean")
+                    # Weight KL similar to medusa head loss
+                    kl_weighted = kl_div * (self.medusa_decay_coefficient ** i) * self.medusa_heads_coefficient
+                    total_loss += kl_weighted
+                    log_metrics[f"medusa{i}_kl"] = kl_div.item()
         LOG.debug(f"Medusa loss breakdown: {log_metrics}")
+        # If enabled, log metrics to Weights & Biases (or via Trainer logging)
+        if self.medusa_logging:
+            try:
+                import wandb
+                # Include current training step in logging if available
+                if self.state and self.state.global_step is not None:
+                    wandb.log(log_metrics, step=self.state.global_step)
+                else:
+                    wandb.log(log_metrics)
+            except ImportError:
+                LOG.warning("Weights & Biases not installed; skipping medusa_logging.")
         return (total_loss, logits) if return_outputs else total_loss
 
     def create_optimizer(self):
@@ -199,19 +292,20 @@ class MedusaConfig(PretrainedConfig):
     Args:
         medusa_num_heads (int, optional): Number of heads for the Medusa layer. Default is 2.
         medusa_num_layers (int, optional): Number of Medusa layers. Default is 1.
-        base_model_name_or_path (str, optional): The name or path of the base model. Default is "lmsys/vicuna-7b-v1.3".
+        base_model_name_or_path (str, optional): The name or path of the base model.
         num_unfreezed_layers (int, optional): Number of layers to unfreeze. Default is 0.
         **kwargs: Additional keyword arguments to be passed to the parent class constructor.
     """
-
     def __init__(
         self,
         medusa_num_heads=4,
         medusa_num_layers=1,
         base_model_name_or_path="lmsys/vicuna-7b-v1.3",
+        num_unfreezed_layers=0,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.medusa_num_heads = medusa_num_heads
         self.medusa_num_layers = medusa_num_layers
         self.base_model_name_or_path = base_model_name_or_path
+        self.num_unfreezed_layers = num_unfreezed_layers
