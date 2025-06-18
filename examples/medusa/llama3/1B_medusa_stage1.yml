@@ -19,11 +19,14 @@ medusa_lr_multiplier: 4.0           # can increase if heads need higher LR
 # blank adapter settings
 adapter: 
 
-# prepare datasets
-pretraining_datasets:
-  - path: json
-    data_files:
-      - /home/nxclab/wonjun/Medusa/ShareGPT_Vicuna_unfiltered/train_shareGPT_llama3.2_1B.jsonl
+# prepare dataset
+# pretraining_dataset:
+#   - path: json
+#     data_files:
+#       - /home/nxclab/wonjun/Medusa/ShareGPT_Vicuna_unfiltered/train_shareGPT_llama3.2_1B.jsonl
+datasets:
+  - path: /home/nxclab/wonjun/Medusa/ShareGPT_Vicuna_unfiltered/train_shareGPT_llama3.2_1B.jsonl
+    type: completion
 val_set_size: 0.01
 output_dir: ./llama3/medusa/1B_stage1
 

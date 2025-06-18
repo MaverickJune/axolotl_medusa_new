@@ -190,3 +190,7 @@ out/
 
 # vim
 *.swp
+
+# custom output dirs
+llama3/
+last_run_prepared/
